@@ -92,15 +92,11 @@ int8_t user_i2c_write(uint8_t reg_addr, const uint8_t *data, uint32_t len,
 }
 
 void user_delay_us(uint32_t period, void *intf_ptr) {
-  // BME68x driver expects microseconds, HAL_Delay is ms, so crude conversion:
-  HAL_Delay(period);
-  //  if (period >= 1000)
-  //    HAL_Delay(period / 1000);
-  //  else
-  //    for (volatile uint32_t i = 0; i < period * 16; i++) {
-  //      __NOP();
-  //    } // crude us delay
+    // Convert microseconds to milliseconds (round up)
+    uint32_t ms = (period + 999) / 1000;
+    HAL_Delay(ms);
 }
+
 
 void BME68x_Init(void) {
   bme.intf = BME68X_I2C_INTF;
