@@ -8,13 +8,16 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "bme68x.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "sx126x.h"
+#include "sx126x_hal.h"
+#include <bme68x.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
 
@@ -36,6 +39,8 @@
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+SPI_HandleTypeDef hspi1;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -48,6 +53,9 @@ volatile uint8_t cmd_buffer[RX_BUFFER_SIZE]; // Buffer for command processing
 volatile uint8_t cmd_length = 0;             // Length of command
 struct bme68x_dev bme;
 int8_t bme_rslt;
+/* LoRa Declarations */
+const void *lora_context = NULL;
+uint8_t emergency_stop = 0;
 
 /* USER CODE END PV */
 
@@ -56,6 +64,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 int8_t user_i2c_read(uint8_t reg_addr, uint8_t *data, uint32_t len,
                      void *intf_ptr);
@@ -64,10 +73,29 @@ int8_t user_i2c_write(uint8_t reg_addr, const uint8_t *data, uint32_t len,
 void user_delay_us(uint32_t period, void *intf_ptr);
 void BME68x_Init(void);
 void process_command(char *command);
+void lora_tx_message(const char *message);
+void lora_continuous_tx(void);
+uint8_t lora_detect_hardware(void);
+void lora_configure(void);
+void debug_busy_pin(void);
+void lora_wait_for_not_busy(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* LoRa config ---------------------------------------------------------------*/
+#define LORA_FREQ_HZ 868000000
+#define LORA_TX_POWER 14
+#define LORA_PAYLOAD_LEN 18
+uint8_t lora_payload[LORA_PAYLOAD_LEN] = "Hello from STM32!";
+
+// GPIO Pin definitions
+#define LORA_RESET_PIN GPIO_PIN_5
+#define LORA_RESET_PORT GPIOB
+#define LORA_BUSY_PIN GPIO_PIN_11
+#define LORA_BUSY_PORT GPIOB
+#define LORA_NSS_PIN GPIO_PIN_10
+#define LORA_NSS_PORT GPIOB
 // Bosch driver-compatible functions
 int8_t user_i2c_read(uint8_t reg_addr, uint8_t *data, uint32_t len,
                      void *intf_ptr) {
@@ -92,11 +120,10 @@ int8_t user_i2c_write(uint8_t reg_addr, const uint8_t *data, uint32_t len,
 }
 
 void user_delay_us(uint32_t period, void *intf_ptr) {
-    // Convert microseconds to milliseconds (round up)
-    uint32_t ms = (period + 999) / 1000;
-    HAL_Delay(ms);
+  // Convert microseconds to milliseconds (round up)
+  uint32_t ms = (period + 999) / 1000;
+  HAL_Delay(ms);
 }
-
 
 void BME68x_Init(void) {
   bme.intf = BME68X_I2C_INTF;
@@ -145,6 +172,285 @@ void BME68x_Init(void) {
   bme_rslt = bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &bme);
   if (bme_rslt != BME68X_OK)
     Error_Handler();
+}
+void debug_busy_pin(void) {
+  const char msg[] = "Debugging BUSY pin...\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+  for (int i = 0; i < 10; i++) {
+    GPIO_PinState state = HAL_GPIO_ReadPin(LORA_BUSY_PORT, LORA_BUSY_PIN);
+    char debug_msg[50];
+    sprintf(debug_msg, "BUSY pin %d: %s\r\n", i,
+            (state == GPIO_PIN_SET) ? "HIGH" : "LOW");
+    HAL_UART_Transmit(&huart2, (uint8_t *)debug_msg, strlen(debug_msg),
+                      HAL_MAX_DELAY);
+    HAL_Delay(100);
+  }
+}
+
+void lora_reset(void) {
+    HAL_GPIO_WritePin(LORA_RESET_PORT, LORA_RESET_PIN, GPIO_PIN_RESET);
+    HAL_Delay(10);
+    HAL_GPIO_WritePin(LORA_RESET_PORT, LORA_RESET_PIN, GPIO_PIN_SET);
+    HAL_Delay(10);
+}
+
+void lora_wait_for_not_busy(void) {
+  while (HAL_GPIO_ReadPin(LORA_BUSY_PORT, LORA_BUSY_PIN) == GPIO_PIN_SET) {
+    HAL_Delay(1);
+  }
+}
+
+uint8_t lora_detect_hardware(void) {
+  const char msg[] = "Detecting LoRa hardware (SPI)...\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+  sx126x_chip_status_t chip_status;
+  sx126x_get_status(lora_context, &chip_status);
+
+  // Print the raw SPI response for diagnosis
+  char dbg[64];
+  sprintf(dbg, "chip_mode: 0x%02X, cmd_status: 0x%02X\r\n",
+          chip_status.chip_mode, chip_status.cmd_status);
+  HAL_UART_Transmit(&huart2, (uint8_t *)dbg, strlen(dbg), HAL_MAX_DELAY);
+
+  if ((chip_status.chip_mode == 0x00 && chip_status.cmd_status == 0x00) ||
+      (chip_status.chip_mode == 0xFF && chip_status.cmd_status == 0xFF)) {
+    const char error[] = "ERROR: LoRa module not detected (SPI check)!\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)error, strlen(error), HAL_MAX_DELAY);
+    return 0;
+  }
+
+  const char success[] = "LoRa hardware detected (SPI check)!\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)success, strlen(success),
+                    HAL_MAX_DELAY);
+  return 1;
+}
+
+void lora_configure(void) {
+  const char msg[] = "Configuring LoRa module...\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+  const char dbg1[] = "Calling lora_detect_hardware...\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)dbg1, strlen(dbg1), HAL_MAX_DELAY);
+
+  if (!lora_detect_hardware()) {
+    const char dbg2[] = "lora_detect_hardware returned 0\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)dbg2, strlen(dbg2), HAL_MAX_DELAY);
+    return;
+  }
+
+  const char dbg3[] = "lora_detect_hardware returned 1\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)dbg3, strlen(dbg3), HAL_MAX_DELAY);
+
+  lora_reset();
+  lora_wait_for_not_busy();
+
+  sx126x_wakeup(lora_context);
+  HAL_Delay(100);
+
+  if (HAL_GPIO_ReadPin(LORA_BUSY_PORT, LORA_BUSY_PIN) == GPIO_PIN_SET) {
+    const char error[] = "ERROR: LoRa module not responding after wakeup!\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)error, strlen(error), HAL_MAX_DELAY);
+    return;
+  }
+
+  sx126x_set_standby(lora_context, SX126X_STANDBY_CFG_RC);
+  lora_wait_for_not_busy();
+
+  sx126x_set_pkt_type(lora_context, SX126X_PKT_TYPE_LORA);
+  lora_wait_for_not_busy();
+
+  sx126x_set_rf_freq(lora_context, LORA_FREQ_HZ);
+  lora_wait_for_not_busy();
+
+  sx126x_mod_params_lora_t mod_params = {.sf = SX126X_LORA_SF7,
+                                         .bw = SX126X_LORA_BW_125,
+                                         .cr = SX126X_LORA_CR_4_5,
+                                         .ldro = 0};
+  sx126x_set_lora_mod_params(lora_context, &mod_params);
+  lora_wait_for_not_busy();
+
+  sx126x_pkt_params_lora_t pkt_params = {.preamble_len_in_symb = 8,
+                                         .header_type =
+                                             SX126X_LORA_PKT_EXPLICIT,
+                                         .pld_len_in_bytes = LORA_PAYLOAD_LEN,
+                                         .crc_is_on = true,
+                                         .invert_iq_is_on = false};
+  sx126x_set_lora_pkt_params(lora_context, &pkt_params);
+  lora_wait_for_not_busy();
+
+  sx126x_set_tx_params(lora_context, LORA_TX_POWER, SX126X_RAMP_200_US);
+  lora_wait_for_not_busy();
+
+  sx126x_set_buffer_base_address(lora_context, 0x00, 0x00);
+  lora_wait_for_not_busy();
+
+  sx126x_clear_irq_status(lora_context, SX126X_IRQ_ALL);
+  lora_wait_for_not_busy();
+
+  const char success[] = "LoRa module configured successfully!\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)success, strlen(success),
+                    HAL_MAX_DELAY);
+}
+
+void lora_tx_message(const char *message) {
+  // Check hardware presence before TX
+  if (!lora_detect_hardware()) {
+    const char error[] = "ERROR: LoRa module not detected before TX!\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)error, strlen(error), HAL_MAX_DELAY);
+    return;
+  }
+
+  const char msg[] = "Sending LoRa message...\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+  debug_busy_pin();
+
+  GPIO_PinState busy_state = HAL_GPIO_ReadPin(LORA_BUSY_PORT, LORA_BUSY_PIN);
+  char debug_msg[50];
+  sprintf(debug_msg, "Current BUSY state: %s\r\n",
+          (busy_state == GPIO_PIN_SET) ? "HIGH" : "LOW");
+  HAL_UART_Transmit(&huart2, (uint8_t *)debug_msg, strlen(debug_msg),
+                    HAL_MAX_DELAY);
+
+  if (busy_state == GPIO_PIN_SET) {
+    const char busy_msg[] = "LoRa module is busy, waiting...\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)busy_msg, strlen(busy_msg),
+                      HAL_MAX_DELAY);
+    lora_wait_for_not_busy();
+  }
+
+  sx126x_clear_irq_status(lora_context, SX126X_IRQ_ALL);
+  lora_wait_for_not_busy();
+
+  uint8_t msg_len = strlen(message);
+  if (msg_len > LORA_PAYLOAD_LEN)
+    msg_len = LORA_PAYLOAD_LEN;
+
+  sx126x_write_buffer(lora_context, 0x00, (uint8_t *)message, msg_len);
+  lora_wait_for_not_busy();
+
+  sx126x_pkt_params_lora_t pkt_params = {.preamble_len_in_symb = 8,
+                                         .header_type =
+                                             SX126X_LORA_PKT_EXPLICIT,
+                                         .pld_len_in_bytes = msg_len,
+                                         .crc_is_on = true,
+                                         .invert_iq_is_on = false};
+  sx126x_set_lora_pkt_params(lora_context, &pkt_params);
+  lora_wait_for_not_busy();
+
+  sx126x_set_tx(lora_context, 5000);
+  lora_wait_for_not_busy();
+
+  const char waiting[] = "Waiting for transmission to complete...\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)waiting, strlen(waiting),
+                    HAL_MAX_DELAY);
+
+  uint32_t timeout = 0;
+  while (timeout < 5000) {
+    sx126x_irq_mask_t irq_status;
+    sx126x_get_irq_status(lora_context, &irq_status);
+
+    if (irq_status & SX126X_IRQ_TX_DONE) {
+      const char success[] = "LoRa TX completed successfully!\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t *)success, strlen(success),
+                        HAL_MAX_DELAY);
+      sx126x_clear_irq_status(lora_context, SX126X_IRQ_TX_DONE);
+
+      sx126x_set_standby(lora_context, SX126X_STANDBY_CFG_RC);
+      lora_wait_for_not_busy();
+      return;
+    }
+
+    if (irq_status & SX126X_IRQ_TIMEOUT) {
+      const char timeout_msg[] = "LoRa TX timeout!\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t *)timeout_msg, strlen(timeout_msg),
+                        HAL_MAX_DELAY);
+      sx126x_clear_irq_status(lora_context, SX126X_IRQ_TIMEOUT);
+
+      sx126x_set_standby(lora_context, SX126X_STANDBY_CFG_RC);
+      lora_wait_for_not_busy();
+      return;
+    }
+
+    HAL_Delay(1);
+    timeout++;
+  }
+
+  const char error[] = "LoRa TX operation timed out!\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)error, strlen(error), HAL_MAX_DELAY);
+
+  sx126x_set_standby(lora_context, SX126X_STANDBY_CFG_RC);
+  lora_wait_for_not_busy();
+}
+
+void lora_continuous_tx(void) {
+    const char msg[] = "Starting continuous LoRa transmission for scanner...\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+    const char help[] = "Look for signals around 868 MHz in your radio scanner\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)help, strlen(help), HAL_MAX_DELAY);
+    const char stop_help[] = "Type 'stop' to stop transmission\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)stop_help, strlen(stop_help), HAL_MAX_DELAY);
+
+    emergency_stop = 0;
+    uint8_t counter = 0;
+
+    while (!emergency_stop) {
+        char message[50];
+        sprintf(message, "STM32 LoRa Test Message #%d - Hello World!", counter++);
+
+        sx126x_clear_irq_status(lora_context, SX126X_IRQ_ALL);
+        lora_wait_for_not_busy();
+
+        uint8_t msg_len = strlen(message);
+        sx126x_write_buffer(lora_context, 0x00, (uint8_t*)message, msg_len);
+        lora_wait_for_not_busy();
+
+        sx126x_pkt_params_lora_t pkt_params = {
+            .preamble_len_in_symb = 12,
+            .header_type = SX126X_LORA_PKT_EXPLICIT,
+            .pld_len_in_bytes = msg_len,
+            .crc_is_on = true,
+            .invert_iq_is_on = false
+        };
+        sx126x_set_lora_pkt_params(lora_context, &pkt_params);
+        lora_wait_for_not_busy();
+
+        sx126x_set_tx(lora_context, 1000);
+        lora_wait_for_not_busy();
+
+        uint32_t timeout = 0;
+        while (timeout < 2000 && !emergency_stop) {
+            sx126x_irq_mask_t irq_status;
+            sx126x_get_irq_status(lora_context, &irq_status);
+
+            if (irq_status & SX126X_IRQ_TX_DONE) {
+                char success_msg[80];
+                sprintf(success_msg, "Sent: %s\r\n", message);
+                HAL_UART_Transmit(&huart2, (uint8_t *)success_msg, strlen(success_msg), HAL_MAX_DELAY);
+                sx126x_clear_irq_status(lora_context, SX126X_IRQ_TX_DONE);
+                break;
+            }
+
+            HAL_Delay(1);
+            timeout++;
+        }
+
+        if (emergency_stop) {
+            const char stop_msg[] = "Emergency stop requested!\r\n";
+            HAL_UART_Transmit(&huart2, (uint8_t *)stop_msg, strlen(stop_msg), HAL_MAX_DELAY);
+            break;
+        }
+
+        sx126x_set_standby(lora_context, SX126X_STANDBY_CFG_RC);
+        lora_wait_for_not_busy();
+
+        HAL_Delay(3000);
+    }
+
+    const char end_msg[] = "Continuous transmission stopped.\r\n";
+    HAL_UART_Transmit(&huart2, (uint8_t *)end_msg, strlen(end_msg), HAL_MAX_DELAY);
 }
 
 void process_command(char *command) {
@@ -278,6 +584,10 @@ void process_command(char *command) {
       const char *msg = "[STM32] Usage: add <number1> <number2>\r\n";
       HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
     }
+  } else if (strcmp(command, "lora tx") == 0) {
+    lora_tx_message("Hello from STM32 LoRa!");
+  } else if (strcmp(command, "lora scan") == 0) {
+      lora_continuous_tx();
   } else {
     const char err[] = "[STM32] Unknown command\r\n";
     HAL_UART_Transmit(&huart2, (uint8_t *)err, strlen(err), HAL_MAX_DELAY);
@@ -341,6 +651,7 @@ int main(void) {
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   // Initialize BME680 sensor
   BME68x_Init();
@@ -471,6 +782,43 @@ static void MX_I2C1_Init(void) {
 }
 
 /**
+ * @brief SPI1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_SPI1_Init(void) {
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_4BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK) {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+}
+
+/**
  * @brief USART2 Initialization Function
  * @param None
  * @retval None
@@ -520,6 +868,7 @@ static void MX_USART2_UART_Init(void) {
  * @retval None
  */
 static void MX_GPIO_Init(void) {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -527,6 +876,22 @@ static void MX_GPIO_Init(void) {
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PB0 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB11 */
+  GPIO_InitStruct.Pin = GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
